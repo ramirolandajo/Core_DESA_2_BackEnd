@@ -34,19 +34,31 @@ public class Event {
 
     private LocalDateTime timestamp;
 
+    // origen del modulo que generó el evento (Ventas, Inventaria, Analitica, MOCK...)
+    @Column(name = "origin_module")
+    private String originModule;
+
     public Event(String type, String payload){
         this.type = type;
         this.payload = payload;
         this.timestamp = LocalDateTime.now();
     }
-    
+
+    public Event(String type, String payload, String originModule){
+        this.type = type;
+        this.payload = payload;
+        this.timestamp = LocalDateTime.now();
+        this.originModule = originModule;
+    }
+
     @Override
      public String toString() { 
         return "Event{" + 
             "type='" + type +
             '\'' + ", payload=" + payload + 
             ", timestamp=" + timestamp +
-          '}'; 
+            ", originModule=" + originModule +
+          '}';
     }
 
 }
