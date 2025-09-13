@@ -72,9 +72,7 @@ public class CoreController {
             events.addAll(kafkaMockService.createPurchase());
 
             events.addAll(kafkaMockService.deactivateProduct());
-            
-            events.addAll(kafkaMockService.deactivateProduct());
-            
+                        
             return new ResponseEntity<>(events,HttpStatus.OK);
         } catch (Exception e) {
             return new ResponseEntity<>(e.getMessage(), HttpStatus.BAD_REQUEST);

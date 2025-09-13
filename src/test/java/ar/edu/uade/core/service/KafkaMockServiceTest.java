@@ -145,7 +145,7 @@ class KafkaMockServiceTest {
         rm.setAttempts(1);
         rm.setMaxAttempts(5);
         rm.setCreatedAt(LocalDateTime.now().minusHours(2));
-        rm.setTtlSeconds(3600L); // 👈 corregido a Long literal
+        rm.setTtlSeconds(3600L); 
 
         when(retryMessageRepository.findAll()).thenReturn(List.of(rm));
 

@@ -64,8 +64,7 @@ class CoreControllerTest {
 
         mockMvc.perform(post("/core/transmit"))
                 .andExpect(status().isOk())
-                // Si al final hay que sacar lo del controller abajo es 11. Si no dejar en 12
-                .andExpect(jsonPath("$.length()").value(12));
+                .andExpect(jsonPath("$.length()").value(11));
     }
 
     @Test
