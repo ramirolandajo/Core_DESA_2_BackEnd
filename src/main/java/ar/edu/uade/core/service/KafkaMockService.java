@@ -1,7 +1,6 @@
 package ar.edu.uade.core.service;
 
 import java.time.LocalDateTime;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -9,16 +8,17 @@ import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
-import ar.edu.uade.core.mock.MockDataFactory;
 import ar.edu.uade.core.model.ConsumeResult;
 import ar.edu.uade.core.model.DeadLetterMessage;
 import ar.edu.uade.core.model.Event;
+import ar.edu.uade.core.model.EventRequest;
 import ar.edu.uade.core.model.LiveMessage;
 import ar.edu.uade.core.model.MessageConsumption;
 import ar.edu.uade.core.model.RetryMessage;
@@ -50,7 +50,12 @@ public class KafkaMockService {
     @Autowired
     private MessageConsumptionRepository consumptionRepository;
 
-    private final MockDataFactory mock = new MockDataFactory();
+    @Autowired
+    private KafkaTemplate<String, Object> kafkaTemplate;
+
+    @Autowired
+    private TopicResolver topicResolver;
+
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     private final int defaultMaxAttempts = 3;
@@ -58,34 +63,29 @@ public class KafkaMockService {
     private final long defaultTtlSeconds = 60 * 60;
     private final int distinctConsumptionThreshold = 2;
 
-    // ----------------- event & live creation (mocks) -----------------
-    private Event persistEvent(String type, Object payload) {
+    // ----------------- event & live creation (from middleware) -----------------
+    private Event persistEvent(String type, String payload, String originModule, LocalDateTime ts) {
+        Event event = new Event();
+        event.setType(type);
+        event.setPayload(payload);
+        event.setOriginModule(originModule);
+        event.setTimestamp(ts != null ? ts : LocalDateTime.now());
+        return eventRepository.save(event);
+    }
+
+    public Event ingestEvent(EventRequest req){
+        if (req == null) throw new IllegalArgumentException("Request is null");
+        if (req.getType() == null || req.getType().isBlank()) throw new IllegalArgumentException("type is required");
+        if (req.getOriginModule() == null || req.getOriginModule().isBlank()) throw new IllegalArgumentException("originModule is required");
+        String payloadJson;
         try {
-            String payloadJson;
-            try {
-                payloadJson = objectMapper.writeValueAsString(payload);
-            } catch (JsonProcessingException e) {
-                payloadJson = payload.toString();
-            }
-            String origin = inferOriginFromType(type);
-            Event event = new Event(type, payloadJson, origin);
-            return eventRepository.save(event);
-        } catch (Exception e) {
+            payloadJson = objectMapper.writeValueAsString(req.getPayload());
+        } catch (JsonProcessingException e) {
             throw new RuntimeException("Error serializando payload", e);
         }
-    }
+        Event event = persistEvent(req.getType(), payloadJson, req.getOriginModule(), req.getTimestamp());
 
-    private String inferOriginFromType(String type) {
-        if (type == null) return "MOCK";
-        String t = type.toLowerCase();
-        if (t.contains("cart") || t.contains("compra") || t.contains("purchase") || t.contains("cartpurchase")) return "Ventas";
-        if (t.contains("stock") || t.contains("reserve") || t.contains("inventory") || t.contains("stockreserved")) return "Inventario";
-        if (t.contains("view") || t.contains("daily") || t.contains("favourite") || t.contains("fav") || t.contains("analytics") || t.contains("product_views") ) return "Analitica";
-        return "MOCK";
-    }
-
-    private Event sendEvent(String type, Object payload) {
-        Event event = persistEvent(type, payload);
+        // crear live message para seguimiento interno
         LiveMessage lm = new LiveMessage();
         lm.setEventId(event.getId());
         lm.setType(event.getType());
@@ -93,95 +93,16 @@ public class KafkaMockService {
         lm.setTimestamp(event.getTimestamp());
         lm.setOriginModule(event.getOriginModule());
         liveMessageRepository.save(lm);
+
+        // publicar en Kafka
+        String topic = topicResolver.resolveTopicForType(req.getType());
+        kafkaTemplate.send(topic, event.getId().toString(), req.getPayload());
+        log.info("Event {} publicado en topic {}", event.getId(), topic);
         return event;
     }
 
     public List<Event> getAll(){
         return eventRepository.findAll();
-    }
-
-    // expose some mocks
-    public List<Event> createBrand() {
-        List<Event> results = new ArrayList<>();
-        results.add(sendEvent("POST: Marca creada", MockDataFactory.sony()));
-        results.add(sendEvent("POST: Marca creada", MockDataFactory.apple()));
-        return results;
-    }
-
-    // RESTAURADOS: métodos que llenan la tabla event + live_message
-    public List<Event> createCategory() {
-        List<Event> results = new ArrayList<>();
-        results.add(sendEvent("POST: Categoría creada", MockDataFactory.audio()));
-        results.add(sendEvent("POST: Categoría creada", MockDataFactory.wearables()));
-        return results;
-    }
-
-    public List<Event> deactivateCategory() {
-        List<Event> results = new ArrayList<>();
-        results.add(sendEvent("PATCH: Categoría desactivada", MockDataFactory.audioInactive()));
-        return results;
-    }
-
-    public List<Event> createProduct() {
-        List<Event> results = new ArrayList<>();
-        results.add(sendEvent("POST: Producto creado", MockDataFactory.sonyHeadphones()));
-        return results;
-    }
-
-    public List<Event> updateProductStockDecrease() {
-        List<Event> results = new ArrayList<>();
-        results.add(sendEvent("PATCH: Stock disminuido", MockDataFactory.sonyHeadphonesDecreaseStock()));
-        return results;
-    }
-
-    public List<Event> updateProductStockIncrease() {
-        List<Event> results = new ArrayList<>();
-        results.add(sendEvent("PATCH: Stock aumentado", MockDataFactory.sonyHeadphonesIncreaseStock()));
-        return results;
-    }
-
-    public List<Event> updateProductPrice() {
-        List<Event> results = new ArrayList<>();
-        results.add(sendEvent("PATCH: Precio actualizado", MockDataFactory.sonyHeadphonesPriceChange()));
-        return results;
-    }
-
-    public List<Event> updateProductGeneral() {
-        List<Event> results = new ArrayList<>();
-        results.add(sendEvent("PUT: Producto actualizado", MockDataFactory.sonyHeadphonesUpdated()));
-        return results;
-    }
-
-    public List<Event> deactivateProduct() {
-        List<Event> results = new ArrayList<>();
-        results.add(sendEvent("PATCH: Producto desactivado", MockDataFactory.sonyHeadphonesDeactivate()));
-        return results;
-    }
-
-    public List<Event> createCart() {
-        List<Event> results = new ArrayList<>();
-        results.add(sendEvent("POST: Carrito creado", MockDataFactory.cartWithSony()));
-        return results;
-    }
-
-    public List<Event> updateCartAddProduct() {
-        List<Event> results = new ArrayList<>();
-        results.add(sendEvent("PUT: Producto agregado al carrito", MockDataFactory.cartAddAppleWatch()));
-        return results;
-    }
-
-    public List<Event> updateCartRemoveProduct() {
-        List<Event> results = new ArrayList<>();
-        results.add(sendEvent("PUT: Producto eliminado del carrito", MockDataFactory.cartRemoveSony()));
-        return results;
-    }
-
-    public List<Event> createPurchase() {
-        List<Event> results = new ArrayList<>();
-        results.add(sendEvent("POST: Compra pendiente", MockDataFactory.purchasePending()));
-        results.add(sendEvent("PATCH: Compra confirmada", MockDataFactory.purchaseConfirmed()));
-        results.add(sendEvent("PATCH: Compra enviada", MockDataFactory.purchaseShipped()));
-        return results;
     }
 
     // ----------------- listas -----------------
@@ -213,6 +134,7 @@ public class KafkaMockService {
         if (liveId != null) rm = retryMessageRepository.findByOriginalLiveId(liveId).orElse(null);
         if (rm == null && liveId != null) rm = retryMessageRepository.findById(liveId).orElse(null);
         if (rm == null && eventId != null) rm = retryMessageRepository.findByEventId(eventId).orElse(null);
+        if (rm == null && eventId == null && liveId != null) rm = retryMessageRepository.findByEventId(liveMessageRepository.findById(liveId).map(LiveMessage::getEventId).orElse(null)).orElse(null);
         if (rm != null){
             res.setLocation("RETRY");
             res.setRetryId(rm.getId());

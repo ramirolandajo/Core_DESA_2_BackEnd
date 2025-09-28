@@ -1,0 +1,80 @@
+version: "3.8"
+
+services:
+  kafka:
+    image: bitnami/kafka:3.7
+    container_name: core-kafka
+    ports:
+      - "9092:9092" # EXTERNAL
+    environment:
+      - KAFKA_ENABLE_KRAFT=yes
+      - KAFKA_CFG_NODE_ID=1
+      - KAFKA_CFG_PROCESS_ROLES=broker,controller
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@kafka:9093
+      # Listeners: INTERNAL (para red docker), EXTERNAL (para host), CONTROLLER
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      - KAFKA_CFG_LISTENERS=INTERNAL://:19092,EXTERNAL://:9092,CONTROLLER://:9093
+      - KAFKA_CFG_ADVERTISED_LISTENERS=INTERNAL://kafka:19092,EXTERNAL://localhost:9092
+      - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=INTERNAL
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true
+    volumes:
+      - kafka_data:/bitnami/kafka
+    networks:
+      - core-net
+
+  mysql:
+    image: mysql:8.0
+    container_name: core-mysql
+    ports:
+      - "3306:3306"
+    environment:
+      - MYSQL_ROOT_PASSWORD=rootpwd
+      - MYSQL_DATABASE=core_dev
+      - MYSQL_USER=core
+      - MYSQL_PASSWORD=corepwd
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - core-net
+
+  core:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: core-service
+    depends_on:
+      - kafka
+      - mysql
+    environment:
+      - SERVER_PORT=8082
+      - SPRING_KAFKA_BOOTSTRAP_SERVERS=kafka:19092
+      - DB_DEV=mysql:3306
+      - USR=core
+      - PASSWORD=corepwd
+    ports:
+      - "8082:8082"
+    restart: unless-stopped
+    networks:
+      - core-net
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: core-kafka-ui
+    depends_on:
+      - kafka
+    ports:
+      - "9094:8080" # UI expuesta en 9094 del host
+    environment:
+      - KAFKA_CLUSTERS_0_NAME=local
+      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:19092
+    networks:
+      - core-net
+
+volumes:
+  kafka_data:
+  mysql_data:
+
+networks:
+  core-net:
+    name: core-net

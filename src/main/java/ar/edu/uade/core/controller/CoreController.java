@@ -1,6 +1,5 @@
 package ar.edu.uade.core.controller;
 
-import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -15,6 +14,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 import ar.edu.uade.core.model.ConsumeResult;
 import ar.edu.uade.core.model.Event;
+import ar.edu.uade.core.model.EventRequest;
 import ar.edu.uade.core.model.LiveMessage;
 import ar.edu.uade.core.model.RetryMessage;
 import ar.edu.uade.core.model.DeadLetterMessage;
@@ -22,8 +22,7 @@ import ar.edu.uade.core.service.KafkaMockService;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestParam;
-
-
+import org.springframework.web.bind.annotation.RequestBody;
 
 @RestController
 @RequestMapping(value = "/core")
@@ -41,47 +40,21 @@ public class CoreController {
             return new ResponseEntity<>(HttpStatus.NO_CONTENT);
         }
     }
-    
-    @PostMapping(value = "/transmit")
-    public ResponseEntity<?>transmit(){
-        // Como esto devuelve un listado completo, para que no quede
-        // una "catarata de eventos" todo de una, desde el front cuando se
-        // itere el listado se le va a poner un sleep que simule que los 
-        // eventos ocurren ent iempo real. SOLO PARA LA PRIMERA ENTREGA
-        List<Event> events = new ArrayList<>();
 
+    // Nuevo endpoint: recibe eventos del middleware y los publica a Kafka
+    @PostMapping(value = "/events", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<?> receiveEvent(@RequestBody EventRequest request){
         try {
-            events.addAll(kafkaMockService.createBrand());
-            
-            events.addAll(kafkaMockService.createCategory());
-            
-            events.addAll(kafkaMockService.createProduct());
-            
-            events.addAll(kafkaMockService.updateProductPrice());
-        
-            events.addAll(kafkaMockService.updateProductStockIncrease());
-
-            events.addAll(kafkaMockService.updateProductGeneral());
-
-            events.addAll(kafkaMockService.createCart());
-
-            events.addAll(kafkaMockService.updateCartAddProduct());
-
-            events.addAll(kafkaMockService.updateCartRemoveProduct());
-
-            events.addAll(kafkaMockService.createPurchase());
-
-            events.addAll(kafkaMockService.deactivateProduct());
-            
-            events.addAll(kafkaMockService.deactivateProduct());
-            
-            return new ResponseEntity<>(events,HttpStatus.OK);
-        } catch (Exception e) {
-            return new ResponseEntity<>(e.getMessage(), HttpStatus.BAD_REQUEST);
+            Event saved = kafkaMockService.ingestEvent(request);
+            return new ResponseEntity<>(saved, HttpStatus.ACCEPTED);
+        } catch (IllegalArgumentException iae){
+            return new ResponseEntity<>(iae.getMessage(), HttpStatus.BAD_REQUEST);
+        } catch (Exception e){
+            return new ResponseEntity<>(e.getMessage(), HttpStatus.INTERNAL_SERVER_ERROR);
         }
     }
-        
-    // Nuevos endpoints para manejar listas de mensajes (vivos, reintentos, muertos)
+
+    // Endpoints para manejar listas de mensajes (vivos, reintentos, muertos)
     @GetMapping(value = "/live", produces = {MediaType.APPLICATION_JSON_VALUE})
     public ResponseEntity<List<LiveMessage>> getLiveMessages(){
         List<LiveMessage> items = kafkaMockService.getLiveMessages();
@@ -100,7 +73,7 @@ public class CoreController {
         return new ResponseEntity<>(items, HttpStatus.OK);
     }
 
-    // Simular que todos los consumidores procesaron los mensajes vivos
+    // Simular que todos los consumidores procesaron los mensajes vivos (utilidad)
     @PostMapping(value = "/consumeAll")
     public ResponseEntity<?> consumeAll(){
         kafkaMockService.consumeAllLive();
@@ -108,7 +81,7 @@ public class CoreController {
     }
 
     // Simular que un consumidor tomó un mensaje y espera respuesta -> mover a retry
-    // Ahora acepta opcionalmente liveMessageId o eventId. Se recomienda enviar eventId
+    // Acepta opcionalmente liveMessageId o eventId. Se recomienda enviar eventId
     @PostMapping(value = "/consumeOne")
     public ResponseEntity<?> consumeOne(
             @RequestParam(required = false) Integer liveMessageId,
