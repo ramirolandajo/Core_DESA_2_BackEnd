@@ -90,6 +90,7 @@
 	</dependencies>
 
 	<build>
+        <finalName>app</finalName>
 		<plugins>
 			<plugin>
 				<groupId>org.apache.maven.plugins</groupId>
@@ -101,6 +102,8 @@
 							<artifactId>lombok</artifactId>
 						</path>
 					</annotationProcessorPaths>
+					<source>${java.version}</source>
+                    <target>${java.version}</target>
 				</configuration>
 			</plugin>
 			<plugin>
