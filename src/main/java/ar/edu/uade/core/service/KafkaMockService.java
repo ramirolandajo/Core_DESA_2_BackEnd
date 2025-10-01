@@ -1,8 +1,11 @@
 package ar.edu.uade.core.service;
 
 import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Set;
+import java.util.UUID;
 import java.util.stream.Collectors;
 
 import org.slf4j.Logger;
@@ -18,6 +21,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import ar.edu.uade.core.model.ConsumeResult;
 import ar.edu.uade.core.model.DeadLetterMessage;
 import ar.edu.uade.core.model.Event;
+import ar.edu.uade.core.model.EventMessage;
 import ar.edu.uade.core.model.EventRequest;
 import ar.edu.uade.core.model.LiveMessage;
 import ar.edu.uade.core.model.MessageConsumption;
@@ -94,10 +98,17 @@ public class KafkaMockService {
         lm.setOriginModule(event.getOriginModule());
         liveMessageRepository.save(lm);
 
-        // publicar en Kafka
-        String topic = topicResolver.resolveTopicForType(req.getType());
-        kafkaTemplate.send(topic, event.getId().toString(), req.getPayload());
-        log.info("Event {} publicado en topic {}", event.getId(), topic);
+        // publicar en Kafka con envelope estandarizado
+        String topic = topicResolver.resolveTopic(req.getType(), req.getOriginModule());
+        EventMessage msg = new EventMessage(
+                UUID.randomUUID().toString(),
+                req.getType(), // eventType mantiene el tipo original
+                OffsetDateTime.now(ZoneOffset.UTC),
+                req.getOriginModule(),
+                req.getPayload()
+        );
+        kafkaTemplate.send(topic, msg.getEventId(), msg);
+        log.info("Event {} publicado en topic {} (msgId={})", event.getId(), topic, msg.getEventId());
         return event;
     }
 
@@ -132,9 +143,19 @@ public class KafkaMockService {
         // buscar en retries
         RetryMessage rm = null;
         if (liveId != null) rm = retryMessageRepository.findByOriginalLiveId(liveId).orElse(null);
-        if (rm == null && liveId != null) rm = retryMessageRepository.findById(liveId).orElse(null);
+        if (rm == null && liveId != null) rm = retryMessageRepository.findById(liveId).orElse(null); // caso cliente pasó retryId
         if (rm == null && eventId != null) rm = retryMessageRepository.findByEventId(eventId).orElse(null);
-        if (rm == null && eventId == null && liveId != null) rm = retryMessageRepository.findByEventId(liveMessageRepository.findById(liveId).map(LiveMessage::getEventId).orElse(null)).orElse(null);
+        if (rm == null && eventId == null && liveId != null) rm = retryMessageRepository.findByEventId(liveId).orElse(null);
+        if (rm == null){
+            // fallback: buscar consumptions previas por liveMessageId y usar eventId encontrado
+            if (liveId != null){
+                var consumptions = consumptionRepository.findByLiveMessageId(liveId);
+                if (consumptions != null && !consumptions.isEmpty()){
+                    Integer evt = consumptions.get(0).getEventId();
+                    rm = retryMessageRepository.findByEventId(evt).orElse(null);
+                }
+            }
+        }
         if (rm != null){
             res.setLocation("RETRY");
             res.setRetryId(rm.getId());

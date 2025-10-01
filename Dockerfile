@@ -4,7 +4,11 @@ WORKDIR /app
 COPY pom.xml ./
 RUN mvn -q -e -DskipTests dependency:go-offline
 COPY src ./src
-RUN mvn -q -DskipTests package
+RUN mvn -q -DskipTests package \
+    && sh -c 'if [ -f target/app.jar ]; then echo "Found target/app.jar"; \
+               elif ls target/*-SNAPSHOT.jar >/dev/null 2>&1; then JAR=$(ls target/*-SNAPSHOT.jar | grep -v original | head -n1) && echo "Using $JAR" && cp "$JAR" target/app.jar; \
+               else echo "No JAR built in target/" && ls -l target || true && exit 1; fi' \
+    && ls -l target
 
 # Etapa de runtime
 FROM eclipse-temurin:17-jre
@@ -15,7 +19,6 @@ ENV SPRING_PROFILES_ACTIVE=default
 # Ej: -e SPRING_KAFKA_BOOTSTRAP_SERVERS=kafka:9092
 #     -e DB_DEV=host.docker.internal:3306 -e USR=root -e PASSWORD=secret
 WORKDIR /app
-COPY --from=build /app/target/core-0.0.1-SNAPSHOT.jar app.jar
+COPY --from=build /app/target/app.jar app.jar
 EXPOSE 8082
 ENTRYPOINT ["sh","-c","java $JAVA_OPTS -Dserver.port=$SERVER_PORT -jar app.jar"]
-

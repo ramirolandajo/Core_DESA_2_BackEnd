@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   kafka:
     image: bitnami/kafka:3.7
@@ -17,44 +15,10 @@ services:
       - KAFKA_CFG_ADVERTISED_LISTENERS=INTERNAL://kafka:19092,EXTERNAL://localhost:9092
       - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=INTERNAL
       - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
-      - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true
+      - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=false
+      - KAFKA_CFG_DELETE_TOPIC_ENABLE=true
     volumes:
       - kafka_data:/bitnami/kafka
-    networks:
-      - core-net
-
-  mysql:
-    image: mysql:8.0
-    container_name: core-mysql
-    ports:
-      - "3306:3306"
-    environment:
-      - MYSQL_ROOT_PASSWORD=rootpwd
-      - MYSQL_DATABASE=core_dev
-      - MYSQL_USER=core
-      - MYSQL_PASSWORD=corepwd
-    volumes:
-      - mysql_data:/var/lib/mysql
-    networks:
-      - core-net
-
-  core:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: core-service
-    depends_on:
-      - kafka
-      - mysql
-    environment:
-      - SERVER_PORT=8082
-      - SPRING_KAFKA_BOOTSTRAP_SERVERS=kafka:19092
-      - DB_DEV=mysql:3306
-      - USR=core
-      - PASSWORD=corepwd
-    ports:
-      - "8082:8082"
-    restart: unless-stopped
     networks:
       - core-net
 

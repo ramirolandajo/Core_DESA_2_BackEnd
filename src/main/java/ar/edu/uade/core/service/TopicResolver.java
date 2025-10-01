@@ -1,59 +1,44 @@
 package ar.edu.uade.core.service;
 
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Map;
-import java.util.Set;
-
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
+import java.util.HashSet;
+import java.util.Set;
 
 @Component
 public class TopicResolver {
 
-    private final Map<String, String> byType = new HashMap<>();
-    private final String fallback = "core.events";
+    @Value("${app.kafka.topic.inventario}")
+    private String inventarioTopic;
+    @Value("${app.kafka.topic.ventas}")
+    private String ventasTopic;
+    @Value("${app.kafka.topic.notificar}")
+    private String notificarTopic;
 
-    public TopicResolver(){
-        // Inventario
-        byType.put("PUT: Actualizar stock", "inventario.actualizar-stock");
-        byType.put("POST: Agregar un producto", "inventario.producto-agregado");
-        byType.put("PUT: Modificar producto", "inventario.producto-modificado");
-        byType.put("PATCH: Producto desactivado", "inventario.producto-desactivado");
-        byType.put("PATCH: Producto activado", "inventario.producto-activado");
-        byType.put("PUT: Producto actualizado", "inventario.producto-actualizado");
-        byType.put("POST: Marca creada", "inventario.marca-creada");
-        byType.put("PATCH: Marca desactivada", "inventario.marca-desactivada");
-        byType.put("POST: Categoría creada", "inventario.categoria-creada");
-        byType.put("POST: Categoria creada", "inventario.categoria-creada");
-        byType.put("PATCH: Categoría desactivada", "inventario.categoria-desactivada");
-        byType.put("PATCH: Categoria desactivada", "inventario.categoria-desactivada");
-        byType.put("POST: Stock rollback - compra cancelada", "inventario.stock-rollback");
-
-        // Ventas
-        byType.put("POST: Compra pendiente", "ventas.compra-pendiente");
-        byType.put("POST: Compra confirmada", "ventas.compra-confirmada");
-        byType.put("DELETE: Compra cancelada", "ventas.compra-cancelada");
-        byType.put("POST: Review creada", "ventas.review-creada");
-        byType.put("POST: Producto agregado a favoritos", "ventas.favorito-agregado");
-        byType.put("DELETE: Producto quitado de favoritos", "ventas.favorito-quitado");
-
-        // Analítica / consultas
-        byType.put("GET: Vista diaria de productos", "analitica.vista-diaria-productos");
-    }
-
-    public String resolveTopicForType(String type){
-        if (type == null) return fallback;
-        String topic = byType.get(type);
-        if (topic != null) return topic;
-        // fallback: normalizar mínimamente
-        String key = type.toLowerCase().replace(' ', '-').replace(':', '-');
-        return "core." + key;
+    public String resolveTopic(String type, String originModule){
+        // 1) Si viene el originModule explícito, usarlo como guía
+        if (originModule != null){
+            String m = originModule.trim().toLowerCase();
+            if (m.startsWith("vent")) return ventasTopic;
+            if (m.startsWith("inven") || m.equals("storage-app")) return inventarioTopic;
+            if (m.startsWith("notif")) return notificarTopic;
+        }
+        // 2) Si no, inferir por prefijo del type: <dominio>.<accion>
+        if (type != null){
+            String t = type.trim().toLowerCase();
+            if (t.startsWith("ventas.")) return ventasTopic;
+            if (t.startsWith("inventario.")) return inventarioTopic;
+            if (t.startsWith("notificar.")) return notificarTopic;
+        }
+        // 3) fallback seguro
+        return inventarioTopic;
     }
 
     public Set<String> getAllTopics(){
-        Set<String> s = new HashSet<>(byType.values());
-        s.add(fallback);
+        Set<String> s = new HashSet<>();
+        s.add(inventarioTopic);
+        s.add(ventasTopic);
+        s.add(notificarTopic);
         return s;
     }
 }
-
