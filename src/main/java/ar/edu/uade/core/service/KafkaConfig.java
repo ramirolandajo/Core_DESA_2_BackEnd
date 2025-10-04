@@ -15,9 +15,13 @@ import org.springframework.kafka.config.TopicBuilder;
 public class KafkaConfig {
 
     @Bean
-    public KafkaAdmin kafkaAdmin(@Value("${spring.kafka.bootstrap-servers}") String bootstrapServers) {
+    public KafkaAdmin kafkaAdmin(@Value("${spring.kafka.bootstrap-servers}") String bootstrapServers,
+                                 @Value("${app.kafka.startup.request-timeout-ms:5000}") int requestTimeoutMs) {
         Map<String, Object> configs = new HashMap<>();
         configs.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+        // Fail fast / timeouts bajos
+        configs.put(AdminClientConfig.REQUEST_TIMEOUT_MS_CONFIG, requestTimeoutMs);
+        configs.put(AdminClientConfig.RETRIES_CONFIG, 0);
         return new KafkaAdmin(configs);
     }
 
