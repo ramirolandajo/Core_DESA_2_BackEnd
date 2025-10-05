@@ -4,10 +4,12 @@ import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
+import ar.edu.uade.core.model.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -18,14 +20,6 @@ import org.springframework.stereotype.Service;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
-import ar.edu.uade.core.model.ConsumeResult;
-import ar.edu.uade.core.model.DeadLetterMessage;
-import ar.edu.uade.core.model.Event;
-import ar.edu.uade.core.model.EventMessage;
-import ar.edu.uade.core.model.EventRequest;
-import ar.edu.uade.core.model.LiveMessage;
-import ar.edu.uade.core.model.MessageConsumption;
-import ar.edu.uade.core.model.RetryMessage;
 import ar.edu.uade.core.repository.DeadLetterRepository;
 import ar.edu.uade.core.repository.EventRepository;
 import ar.edu.uade.core.repository.LiveMessageRepository;
@@ -362,5 +356,128 @@ public class KafkaMockService {
             }
         }
     }
+    public void handleAcknowledgement(AcknowledgementRequest ack) {
+        Integer eventId = ack.getEventId();
+        Integer liveMessageId = ack.getLiveMessageId();
+        String moduleName = ack.getModuleName();
+        String status = ack.getStatus();
 
+        log.info("[Core] ACK recibido --> eventId={} | liveMessageId={} | módulo={} | status={}",
+                eventId, liveMessageId, moduleName, status);
+
+        // Registrar consumo
+        MessageConsumption mc = new MessageConsumption();
+        mc.setEventId(eventId);
+        mc.setLiveMessageId(liveMessageId);
+        mc.setModuleName(moduleName);
+        mc.setConsumedAt(LocalDateTime.now());
+        consumptionRepository.save(mc);
+
+        Optional<LiveMessage> liveOpt = liveMessageRepository.findById(liveMessageId);
+        if (liveOpt.isEmpty()) {
+            log.warn("[Core] No se encontró LiveMessage {} para ACK.", liveMessageId);
+            return;
+        }
+
+        LiveMessage live = liveOpt.get();
+        String eventType = live.getType();
+
+        // Si status = "FAILED" lo paso a la cola de reintento
+        if ("FAIL".equalsIgnoreCase(status)) {
+            moveMessageToRetry(liveMessageId, moduleName);
+            return;
+        }
+
+        // Si todos los modulos que tenian que consumir consumieron lo paso a cola de muertos y borro de live
+        if (allModulesConsumedSuccessfully(eventId, eventType)) {
+            DeadLetterMessage dm = new DeadLetterMessage();
+            dm.setEventId(liveMessageId);
+            dm.setType(live.getType());
+            dm.setPayload(live.getPayload());
+            dm.setReason("SUCCESS");
+            dm.setMovedAt(LocalDateTime.now());
+
+            deadLetterRepository.save(dm);
+            liveMessageRepository.delete(live);
+
+            log.info("[Core] Evento {} (tipo: {}) consumido por todos los destinos. Eliminado de Live.", eventId, eventType);
+        }
+    }
+
+    private boolean allModulesConsumedSuccessfully(Integer eventId, String eventType) {
+        List<String> expectedModules = getExpectedConsumers(eventType);
+        if (expectedModules.isEmpty()) {
+            log.info("[Core] Evento {} no tiene módulos destino configurados, se considera consumido.", eventId);
+            return true;
+        }
+
+        List<MessageConsumption> consumptions = consumptionRepository.findByEventId(eventId);
+        Set<String> consumedModules = consumptions.stream()
+                .map(mc -> mc.getModuleName().toLowerCase())
+                .collect(Collectors.toSet());
+
+        boolean allOk = consumedModules.containsAll(expectedModules);
+
+        if (allOk) {
+            log.info("[Core] Evento {} consumido por todos los módulos esperados: {}", eventId, expectedModules);
+        } else {
+            log.info("[Core] Evento {} aún pendiente de consumo por: {}",
+                    eventId,
+                    expectedModules.stream().filter(m -> !consumedModules.contains(m)).toList());
+        }
+
+        return allOk;
+    }
+
+    private List<String> getExpectedConsumers(String eventType) {
+        String type = eventType.toLowerCase();
+
+        if (type.contains("stock") || type.contains("producto") || type.contains("marca") || type.contains("categoría")) {
+            return List.of("ventas", "analitica");
+        }
+        if (type.contains("pendiente")) {
+            return List.of("inventario");
+        }
+        if (type.contains("confirmada")) {
+            return List.of("inventario", "analitica");
+        }
+        if (type.contains("cancelada") || type.contains("rollback")) {
+            return List.of("inventario");
+        }
+        if (type.contains("review") || type.contains("favorito") || type.contains("vista")) {
+            return List.of("analitica");
+        }
+        if (type.contains("batch")) {
+            return List.of("ventas", "analitica");
+        }
+        return List.of(); // por defecto, ninguno
+    }
+
+    private void moveMessageToRetry(Integer liveMessageId, String failedModule) {
+        Optional<LiveMessage> liveOpt = liveMessageRepository.findById(liveMessageId);
+        if (liveOpt.isEmpty()) {
+            log.warn("[Core] No se encontró LiveMessage con ID {} para mover a Retry", liveMessageId);
+            return;
+        }
+
+        LiveMessage live = liveOpt.get();
+
+        RetryMessage retry = new RetryMessage();
+        retry.setEventId(live.getEventId());
+        retry.setOriginalLiveId(live.getId());
+        retry.setType(live.getType());
+        retry.setPayload(live.getPayload());
+        retry.setAttempts(0); //es 0 xq si estaba en la cola de vivos quiere decir que nunca se reintento
+        retry.setMaxAttempts(defaultMaxAttempts);
+        retry.setTtlSeconds(600L); // 10 min. modificarlo para pruebas o expos
+        retry.setCreatedAt(LocalDateTime.now());
+        retry.setNextAttemptAt(LocalDateTime.now().plusMinutes(2)); // reintentar en 2 min
+        retry.setConsumerModule(failedModule);
+
+        retryMessageRepository.save(retry);
+        liveMessageRepository.delete(live);
+
+        log.info("[Core] Evento {} (tipo: {}) movido a Retry. Módulo fallido: {}",
+                live.getEventId(), live.getType(), failedModule);
+    }
 }
