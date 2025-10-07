@@ -8,8 +8,8 @@ import org.apache.kafka.clients.admin.NewTopic;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.kafka.core.KafkaAdmin;
 import org.springframework.kafka.config.TopicBuilder;
+import org.springframework.kafka.core.KafkaAdmin;
 
 @Configuration
 public class KafkaConfig {
@@ -22,7 +22,12 @@ public class KafkaConfig {
         // Fail fast / timeouts bajos
         configs.put(AdminClientConfig.REQUEST_TIMEOUT_MS_CONFIG, requestTimeoutMs);
         configs.put(AdminClientConfig.RETRIES_CONFIG, 0);
-        return new KafkaAdmin(configs);
+        // También bajar los backoffs para no alargar los intentos
+        configs.put("reconnect.backoff.ms", 250);
+        configs.put("reconnect.backoff.max.ms", 1000);
+        KafkaAdmin admin = new KafkaAdmin(configs);
+        admin.setFatalIfBrokerNotAvailable(true); // cortar el arranque si no hay broker
+        return admin;
     }
 
     @Bean

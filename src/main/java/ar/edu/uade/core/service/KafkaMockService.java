@@ -6,12 +6,16 @@ import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.SendResult;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
@@ -67,6 +71,14 @@ public class KafkaMockService {
     private final long defaultTtlSeconds = 60 * 60;
     private final int distinctConsumptionThreshold = 2;
 
+    // Config reintentos de envío a Kafka (fail-fast)
+    @Value("${app.kafka.send.max-attempts:3}")
+    private int sendMaxAttempts;
+    @Value("${app.kafka.send.backoff-ms:500}")
+    private long sendBackoffMs;
+    @Value("${app.kafka.send.timeout-ms:5000}")
+    private long sendTimeoutMs;
+
     // ----------------- event & live creation (from middleware) -----------------
     private Event persistEvent(String type, String payload, String originModule, LocalDateTime ts) {
         Event event = new Event();
@@ -107,9 +119,36 @@ public class KafkaMockService {
                 req.getOriginModule(),
                 req.getPayload()
         );
-        kafkaTemplate.send(topic, msg.getEventId(), msg);
+        // Envío síncrono con reintentos limitados
+        sendToKafkaWithRetries(topic, msg.getEventId(), msg);
         log.info("Event {} publicado en topic {} (msgId={})", event.getId(), topic, msg.getEventId());
         return event;
+    }
+
+    private void sendToKafkaWithRetries(String topic, String key, Object value){
+        int attempt = 0;
+        Exception last = null;
+        while (attempt < sendMaxAttempts){
+            attempt++;
+            try {
+                log.debug("[KafkaSend] Enviando a topic='{}' intento {}/{}", topic, attempt, sendMaxAttempts);
+                CompletableFuture<SendResult<String, Object>> future = kafkaTemplate.send(topic, key, value);
+                // esperar resultado con timeout para fail-fast
+                SendResult<String, Object> res = future.get(sendTimeoutMs, TimeUnit.MILLISECONDS);
+                if (res != null) {
+                    return; // OK
+                }
+            } catch (Exception ex){
+                last = ex;
+                log.warn("[KafkaSend] Fallo en envio a '{}' intento {}/{}: {}", topic, attempt, sendMaxAttempts, ex.getMessage());
+                if (attempt < sendMaxAttempts){
+                    try { Thread.sleep(sendBackoffMs); } catch (InterruptedException ie){ Thread.currentThread().interrupt(); }
+                }
+            }
+        }
+        String err = String.format("No se pudo publicar en Kafka tras %d intentos (topic=%s)", sendMaxAttempts, topic);
+        log.error("[KafkaSend] {}", err, last);
+        throw new IllegalStateException(err, last);
     }
 
     public List<Event> getAll(){
@@ -187,15 +226,6 @@ public class KafkaMockService {
         if (liveId != null) return consumptionRepository.findByLiveMessageId(liveId);
         if (eventId != null) return consumptionRepository.findByEventId(eventId);
         return consumptionRepository.findAll();
-    }
-
-    // Obtener live/retry por id
-    public LiveMessage getLiveById(Integer id){
-        return liveMessageRepository.findById(id).orElse(null);
-    }
-
-    public RetryMessage getRetryById(Integer id){
-        return retryMessageRepository.findById(id).orElse(null);
     }
 
     // ----------------- consumo (core) -----------------
