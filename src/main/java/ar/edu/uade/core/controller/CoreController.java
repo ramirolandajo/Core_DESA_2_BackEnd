@@ -4,6 +4,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+import ar.edu.uade.core.model.*;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.http.HttpStatus;
@@ -12,12 +13,6 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
-import ar.edu.uade.core.model.ConsumeResult;
-import ar.edu.uade.core.model.Event;
-import ar.edu.uade.core.model.EventRequest;
-import ar.edu.uade.core.model.LiveMessage;
-import ar.edu.uade.core.model.RetryMessage;
-import ar.edu.uade.core.model.DeadLetterMessage;
 import ar.edu.uade.core.service.KafkaMockService;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -155,5 +150,17 @@ public class CoreController {
         kafkaMockService.processRetriesAndExpire();
         return new ResponseEntity<>(HttpStatus.OK);
     }
+
+    @PostMapping("/ack")
+    public ResponseEntity<String> acknowledgeEvent(@RequestBody AcknowledgementRequest ack) {
+        try {
+            kafkaMockService.handleAcknowledgement(ack);
+            return ResponseEntity.ok("ACK recibido correctamente");
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body("Error procesando ACK: " + e.getMessage());
+        }
+    }
+
 
 }
