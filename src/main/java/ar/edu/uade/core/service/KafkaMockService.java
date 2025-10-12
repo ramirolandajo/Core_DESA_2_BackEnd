@@ -386,53 +386,74 @@ public class KafkaMockService {
             }
         }
     }
-    public void handleAcknowledgement(AcknowledgementRequest ack) {
-        Integer eventId = ack.getEventId();
-        Integer liveMessageId = ack.getLiveMessageId();
-        String moduleName = ack.getModuleName();
+    @Transactional
+    public void handleAcknowledgement(EventAckEntity ack) {
+        if (ack == null) {
+            log.warn("[Core] ACK recibido es nulo. Se ignora.");
+            return;
+        }
+
+        String eventId = ack.getEventId();
+        String consumer = ack.getConsumer();
         String status = ack.getStatus();
 
-        log.info("[Core] ACK recibido --> eventId={} | liveMessageId={} | módulo={} | status={}",
-                eventId, liveMessageId, moduleName, status);
+        log.info("[Core] ACK recibido --> eventId={} | consumer={} | status={} | attempts={}",
+                eventId, consumer, status, ack.getAttempts());
 
-        // Registrar consumo
-        MessageConsumption mc = new MessageConsumption();
-        mc.setEventId(eventId);
-        mc.setLiveMessageId(liveMessageId);
-        mc.setModuleName(moduleName);
-        mc.setConsumedAt(LocalDateTime.now());
-        consumptionRepository.save(mc);
+        if (eventId == null || eventId.isBlank()) {
+            log.warn("[Core] ACK inválido: eventId es null o vacío. Se ignora.");
+            return;
+        }
 
-        Optional<LiveMessage> liveOpt = liveMessageRepository.findById(liveMessageId);
+        // Buscar LiveMessage asociado al eventId
+        Optional<LiveMessage> liveOpt = liveMessageRepository.findByEventId(Integer.valueOf(eventId));
         if (liveOpt.isEmpty()) {
-            log.warn("[Core] No se encontró LiveMessage {} para ACK.", liveMessageId);
+            log.warn("[Core] No se encontró LiveMessage para eventId={}", eventId);
             return;
         }
 
         LiveMessage live = liveOpt.get();
         String eventType = live.getType();
 
-        // Si status = "FAILED" lo paso a la cola de reintento
-        if ("FAIL".equalsIgnoreCase(status)) {
-            moveMessageToRetry(liveMessageId, moduleName);
+        // Registrar consumo
+        MessageConsumption mc = new MessageConsumption();
+        mc.setEventId(live.getEventId());
+        mc.setLiveMessageId(live.getId());
+        mc.setModuleName(consumer != null ? consumer : "Desconocido");
+        mc.setConsumedAt(LocalDateTime.now());
+        consumptionRepository.save(mc);
+
+        // Procesar el ACK según estado
+        if ("FAIL".equalsIgnoreCase(status) || "FAILED".equalsIgnoreCase(status)) {
+            log.info("[Core] ACK indica fallo. Moviendo LiveMessage {} (eventId={}) a cola de reintentos.",
+                    live.getId(), eventId);
+            moveMessageToRetry(live.getId(), consumer);
             return;
         }
 
-        // Si todos los modulos que tenian que consumir consumieron lo paso a cola de muertos y borro de live
-        if (allModulesConsumedSuccessfully(eventId, eventType)) {
-            DeadLetterMessage dm = new DeadLetterMessage();
-            dm.setEventId(liveMessageId);
-            dm.setType(live.getType());
-            dm.setPayload(live.getPayload());
-            dm.setReason("SUCCESS");
-            dm.setMovedAt(LocalDateTime.now());
+        if ("CONSUMED".equalsIgnoreCase(status) || "SUCCESS".equalsIgnoreCase(status)) {
+            // Verificar si todos los consumidores ya consumieron este evento
+            if (allModulesConsumedSuccessfully(live.getEventId(), eventType)) {
+                DeadLetterMessage dm = new DeadLetterMessage();
+                dm.setEventId(live.getEventId());
+                dm.setType(live.getType());
+                dm.setPayload(live.getPayload());
+                dm.setReason("SUCCESS");
+                dm.setMovedAt(LocalDateTime.now());
 
-            deadLetterRepository.save(dm);
-            liveMessageRepository.delete(live);
+                deadLetterRepository.save(dm);
+                liveMessageRepository.delete(live);
 
-            log.info("[Core] Evento {} (tipo: {}) consumido por todos los destinos. Eliminado de Live.", eventId, eventType);
+                log.info("[Core] Evento {} (tipo: {}) consumido exitosamente por todos los módulos. Movido a DeadLetter y eliminado de Live.",
+                        live.getEventId(), eventType);
+            } else {
+                log.debug("[Core] Evento {} aún tiene módulos pendientes de consumo.", eventId);
+            }
+        } else {
+            log.warn("[Core] Estado de ACK desconocido: '{}'. No se realiza ninguna acción.", status);
         }
     }
+
 
     private boolean allModulesConsumedSuccessfully(Integer eventId, String eventType) {
         List<String> expectedModules = getExpectedConsumers(eventType);

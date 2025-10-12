@@ -152,7 +152,7 @@ public class CoreController {
     }
 
     @PostMapping("/ack")
-    public ResponseEntity<String> acknowledgeEvent(@RequestBody AcknowledgementRequest ack) {
+    public ResponseEntity<String> acknowledgeEvent(@RequestBody EventAckEntity ack) {
         try {
             kafkaMockService.handleAcknowledgement(ack);
             return ResponseEntity.ok("ACK recibido correctamente");
