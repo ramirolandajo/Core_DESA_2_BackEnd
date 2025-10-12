@@ -9,5 +9,5 @@ import ar.edu.uade.core.model.LiveMessage;
 
 @Repository
 public interface LiveMessageRepository extends JpaRepository<LiveMessage, Integer>{
-    Optional<LiveMessage> findByEventId(Integer eventId);
+    Optional<LiveMessage> findByEventId(String eventId);
 }
