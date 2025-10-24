@@ -65,9 +65,8 @@ jobs:
         with:
           aws_access_key: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws_secret_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          application_name: "Core Dev"
-          environment_name: Core-dev-env
-          existing_bucket_name: core-dev-backend-bucket
+          application_name: core-dev-app
+          environment_name: core-dev-env
           version_label: ${{ env.VERSION_LABEL }}
           region: sa-east-1
           deployment_package: ./artifact/app.jar
