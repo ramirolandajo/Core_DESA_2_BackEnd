@@ -162,7 +162,7 @@ public class KafkaMockService {
         // buscar en live
         LiveMessage lm = null;
         if (liveId != null) lm = liveMessageRepository.findById(liveId).orElse(null);
-        if (lm == null && eventId != null) lm = liveMessageRepository.findByEventId(String.valueOf(eventId)).orElse(null);
+        if (lm == null && eventId != null) lm = liveMessageRepository.findByEventId(eventId).orElse(null);
         if (lm != null){
             res.setLocation("LIVE");
             res.setLiveId(lm.getId());
@@ -230,7 +230,7 @@ public class KafkaMockService {
         // 1) intentar localizar live message
         LiveMessage lm = null;
         if (liveMessageId != null) lm = liveMessageRepository.findById(liveMessageId).orElse(null);
-        if (lm == null && eventId != null) lm = liveMessageRepository.findByEventId(String.valueOf(eventId)).orElse(null);
+        if (lm == null && eventId != null) lm = liveMessageRepository.findByEventId(eventId).orElse(null);
 
         // 2) si no hay live, intentar localizar retry por varios caminos
         if (lm == null){
@@ -406,7 +406,7 @@ public class KafkaMockService {
         }
 
         // Buscar LiveMessage asociado al eventId
-        Optional<LiveMessage> liveOpt = liveMessageRepository.findByEventId((ack.getEventId()));
+        Optional<LiveMessage> liveOpt = liveMessageRepository.findByEventId(Integer.valueOf(ack.getEventId()));
         if (liveOpt.isEmpty()) {
             log.warn("[Core] No se encontró LiveMessage para eventId={}", eventId);
             return;
