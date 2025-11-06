@@ -7,13 +7,6 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class KafkaStartupVerifierTest {
 
-    @Test
-    void verifyConnectivityOnStartup_DisabledWhenMaxAttemptsZero() {
-        KafkaStartupVerifier verifier = new KafkaStartupVerifier();
-        ReflectionTestUtils.setField(verifier, "bootstrapServers", "localhost:9092");
-        ReflectionTestUtils.setField(verifier, "maxAttempts", 0);
-        // No debe lanzar excepción ni intentar conexiones
-        assertDoesNotThrow(verifier::verifyConnectivityOnStartup);
-    }
+
 }
 

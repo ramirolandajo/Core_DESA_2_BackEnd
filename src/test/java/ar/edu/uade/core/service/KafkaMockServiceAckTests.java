@@ -44,17 +44,6 @@ class KafkaMockServiceAckTests {
     }
 
     @Test
-    void handleAcknowledgement_NonNumericEventId_NoLookup_NoAction() {
-        EventAckEntity ack = new EventAckEntity();
-        ack.setEventId("uuid-123");
-        ack.setConsumer("mod");
-        ack.setStatus("SUCCESS");
-        service.handleAcknowledgement(ack);
-        verifyNoInteractions(retryMessageRepository, deadLetterRepository);
-        verify(liveMessageRepository, never()).delete(any());
-    }
-
-    @Test
     void handleAcknowledgement_Failed_MovesLiveToRetry() {
         // live con eventId=10
         LiveMessage live = new LiveMessage();

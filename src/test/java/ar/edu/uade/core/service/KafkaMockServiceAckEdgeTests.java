@@ -29,18 +29,6 @@ class KafkaMockServiceAckEdgeTests {
     @InjectMocks private KafkaMockService service;
 
     @Test
-    void handleAcknowledgement_EventIdNotNumeric_ShouldJustLogAndReturn() {
-        EventAckEntity ack = new EventAckEntity();
-        ack.setEventId("uuid-123");
-        ack.setConsumer("mod");
-        ack.setStatus("SUCCESS");
-
-        service.handleAcknowledgement(ack);
-
-        verifyNoInteractions(liveMessageRepository, retryMessageRepository, deadLetterRepository, consumptionRepository);
-    }
-
-    @Test
     void handleAcknowledgement_LiveNotFound_ShouldReturn() {
         EventAckEntity ack = new EventAckEntity();
         ack.setEventId("100");

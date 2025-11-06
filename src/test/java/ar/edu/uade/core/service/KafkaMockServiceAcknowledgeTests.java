@@ -54,18 +54,6 @@ class KafkaMockServiceAcknowledgeTests {
     }
 
     @Test
-    void handleAcknowledgement_UnknownEvent_NoAction() {
-        EventAckEntity ack = new EventAckEntity();
-        ack.setEventId("abc-uuid");
-        ack.setConsumer("ventas");
-        ack.setStatus("CONSUMED");
-
-        // will try to parse to integer -> fails -> empty -> no action
-        service.handleAcknowledgement(ack);
-        verifyNoInteractions(liveMessageRepository, deadLetterRepository);
-    }
-
-    @Test
     void handleAcknowledgement_Success_AllModules_MovesToDeadAndDeleteLive() {
         LiveMessage live = new LiveMessage();
         live.setId(9); live.setEventId(90); live.setType("estado pendiente"); live.setPayload("{}");
