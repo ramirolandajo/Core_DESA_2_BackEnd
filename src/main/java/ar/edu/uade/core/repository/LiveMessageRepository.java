@@ -9,6 +9,5 @@ import ar.edu.uade.core.model.LiveMessage;
 
 @Repository
 public interface LiveMessageRepository extends JpaRepository<LiveMessage, Integer>{
-    // eventId is stored as Integer in LiveMessage entity
     Optional<LiveMessage> findByEventId(Integer eventId);
 }
