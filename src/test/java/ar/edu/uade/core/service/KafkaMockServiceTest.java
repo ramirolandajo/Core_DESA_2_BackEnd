@@ -2,202 +2,213 @@ package ar.edu.uade.core.service;
 
 import ar.edu.uade.core.model.*;
 import ar.edu.uade.core.repository.*;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
-import org.mockito.MockitoAnnotations;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.SendResult;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 
 import static org.junit.jupiter.api.Assertions.*;
-import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
+@ExtendWith(MockitoExtension.class)
 class KafkaMockServiceTest {
 
-    @Mock
-    private EventRepository eventRepository;
-    @Mock
-    private LiveMessageRepository liveMessageRepository;
-    @Mock
-    private RetryMessageRepository retryMessageRepository;
-    @Mock
-    private DeadLetterRepository deadLetterRepository;
-    @Mock
-    private MessageConsumptionRepository consumptionRepository;
+    @Mock private EventRepository eventRepository;
+    @Mock private LiveMessageRepository liveMessageRepository;
+    @Mock private RetryMessageRepository retryMessageRepository;
+    @Mock private DeadLetterRepository deadLetterRepository;
+    @Mock private MessageConsumptionRepository consumptionRepository;
+    @Mock private KafkaTemplate<String, Object> kafkaTemplate;
+    @Mock private TopicResolver topicResolver;
 
-    @InjectMocks
-    private KafkaMockService kafkaMockService;
-
-    private final ObjectMapper objectMapper = new ObjectMapper();
+    @InjectMocks private KafkaMockService service;
 
     @BeforeEach
-    void setUp() {
-        MockitoAnnotations.openMocks(this);
+    void init() {
+        ReflectionTestUtils.setField(service, "sendMaxAttempts", 1);
+        ReflectionTestUtils.setField(service, "sendBackoffMs", 1L);
+        ReflectionTestUtils.setField(service, "sendTimeoutMs", 10L);
     }
 
     @Test
-    void sendEvent_ShouldPersistEventAndLiveMessage() {
-        Event e = new Event("POST: Producto creado", "{}", "MOCK");
-        e.setId(1);
+    void ingestEvent_ValidRequest_PersistsEventAndPublishes() {
+        EventRequest req = new EventRequest();
+        req.setType("ventas.creada");
+        req.setOriginModule("ventas");
+        req.setPayload(java.util.Map.of("id", 1));
+        req.setTimestamp(LocalDateTime.now());
 
-        when(eventRepository.save(any(Event.class))).thenReturn(e);
+        when(eventRepository.save(any(Event.class))).thenAnswer(inv -> {
+            Event e = inv.getArgument(0);
+            e.setId(10);
+            return e;
+        });
+        when(topicResolver.resolveTopic(anyString(), anyString())).thenReturn("topicV");
+        // Devuelve un SendResult no nulo para evitar el fallo por reintentos
+        @SuppressWarnings("unchecked")
+        SendResult<String, Object> sr = (SendResult<String, Object>) mock(SendResult.class);
+        CompletableFuture<SendResult<String, Object>> okFuture = CompletableFuture.completedFuture(sr);
+        when(kafkaTemplate.send(anyString(), anyString(), any())).thenReturn(okFuture);
 
-        Event result = kafkaMockService.createProduct().get(0);
+        Event saved = service.ingestEvent(req);
 
-        assertNotNull(result);
-        assertEquals("POST: Producto creado", result.getType());
-        verify(liveMessageRepository, atLeastOnce()).save(any(LiveMessage.class));
+        assertNotNull(saved);
+        assertEquals(10, saved.getId());
+        verify(eventRepository).save(any(Event.class));
+        verify(liveMessageRepository).save(any(LiveMessage.class));
+        verify(topicResolver).resolveTopic(eq("ventas.creada"), eq("ventas"));
+        verify(kafkaTemplate).send(eq("topicV"), anyString(), any());
     }
 
     @Test
-    void consumeOneAndMoveToRetry_ShouldMoveLiveToRetry() {
-        Event ev = new Event("POST: test", "{}", "Ventas");
-        ev.setId(1);
-
-        LiveMessage lm = new LiveMessage();
-        lm.setId(10);
-        lm.setEventId(1);
-        lm.setOriginModule("Inventario");
-        lm.setType(ev.getType());
-        lm.setPayload(ev.getPayload());
-        lm.setTimestamp(LocalDateTime.now());
-
-        when(liveMessageRepository.findById(10)).thenReturn(Optional.of(lm));
-        when(eventRepository.findById(1)).thenReturn(Optional.of(ev));
-        when(consumptionRepository.existsByEventIdAndModuleName(1, "Analytics")).thenReturn(false);
-
-        ConsumeResult result = kafkaMockService.consumeOneAndMoveToRetry(10, null, "Analytics");
-
-        assertEquals(ConsumeResult.Status.RETRY, result.getStatus());
-        verify(retryMessageRepository, times(1)).save(any(RetryMessage.class));
-        verify(liveMessageRepository, times(1)).deleteById(10);
+    void ingestEvent_NullRequest_ThrowsIAE() {
+        assertThrows(IllegalArgumentException.class, () -> service.ingestEvent(null));
     }
 
     @Test
-    void consumeOneAndMoveToRetry_ShouldReturnConflict_WhenSameOriginModule() {
-        LiveMessage lm = new LiveMessage();
-        lm.setId(10);
-        lm.setEventId(1);
-        lm.setOriginModule("Ventas");
-
-        when(liveMessageRepository.findById(10)).thenReturn(Optional.of(lm));
-
-        ConsumeResult result = kafkaMockService.consumeOneAndMoveToRetry(10, null, "Ventas");
-
-        assertEquals(ConsumeResult.Status.CONFLICT, result.getStatus());
+    void ingestEvent_BlankType_ThrowsIAE() {
+        EventRequest req = new EventRequest();
+        req.setType(" ");
+        req.setOriginModule("ventas");
+        assertThrows(IllegalArgumentException.class, () -> service.ingestEvent(req));
     }
 
     @Test
-    void acknowledgeRetry_ShouldDeleteRetryMessage() {
-        when(retryMessageRepository.existsById(5)).thenReturn(true);
-
-        boolean result = kafkaMockService.acknowledgeRetry(5);
-
-        assertTrue(result);
-        verify(retryMessageRepository, times(1)).deleteById(5);
+    void ingestEvent_BlankOrigin_ThrowsIAE() {
+        EventRequest req = new EventRequest();
+        req.setType("ventas.creada");
+        req.setOriginModule(" ");
+        assertThrows(IllegalArgumentException.class, () -> service.ingestEvent(req));
     }
 
     @Test
-    void failRetry_ShouldMoveToDeadLetter_WhenMaxAttemptsExceeded() {
+    void consumeOneAndMoveToRetry_NotFound_ReturnsNotFound() {
+        when(liveMessageRepository.findById(anyInt())).thenReturn(Optional.empty());
+        when(liveMessageRepository.findByEventId(anyInt())).thenReturn(Optional.empty());
+        when(retryMessageRepository.findByOriginalLiveId(anyInt())).thenReturn(Optional.empty());
+        when(retryMessageRepository.findById(anyInt())).thenReturn(Optional.empty());
+        when(retryMessageRepository.findByEventId(anyInt())).thenReturn(Optional.empty());
+
+        ConsumeResult res = service.consumeOneAndMoveToRetry(99, 100, "modX");
+        assertEquals(ConsumeResult.Status.NOT_FOUND, res.getStatus());
+    }
+
+    @Test
+    void consumeOneAndMoveToRetry_LiveFoundSameOrigin_Conflict() {
+        LiveMessage live = new LiveMessage();
+        live.setId(1);
+        live.setEventId(7);
+        live.setOriginModule("ventas");
+        when(liveMessageRepository.findById(1)).thenReturn(Optional.of(live));
+
+        ConsumeResult res = service.consumeOneAndMoveToRetry(1, null, "VENTAS");
+        assertEquals(ConsumeResult.Status.CONFLICT, res.getStatus());
+    }
+
+    @Test
+    void consumeOneAndMoveToRetry_LiveFound_FirstConsumptionCreatesRetry() {
+        LiveMessage live = new LiveMessage();
+        live.setId(1);
+        live.setEventId(7);
+        live.setType("ventas.creada");
+        live.setPayload("{}");
+        when(liveMessageRepository.findById(1)).thenReturn(Optional.of(live));
+        when(consumptionRepository.existsByEventIdAndModuleName(eq(7), anyString())).thenReturn(false);
+        when(consumptionRepository.findByEventId(7)).thenReturn(java.util.Collections.emptyList());
+
+        ConsumeResult res = service.consumeOneAndMoveToRetry(1, null, "inventario");
+
+        assertEquals(ConsumeResult.Status.RETRY, res.getStatus());
+        assertNotNull(res.getRetryMessage());
+        verify(retryMessageRepository).save(any(RetryMessage.class));
+        verify(liveMessageRepository).deleteById(1);
+    }
+
+    @Test
+    void failRetry_WhenBelowMaxAttempts_ReturnsRetryAndIncrements() {
         RetryMessage rm = new RetryMessage();
-        rm.setId(1);
-        rm.setEventId(100);
-        rm.setAttempts(3);
-        rm.setMaxAttempts(3);
-        rm.setType("PATCH");
-        rm.setPayload("{}");
+        rm.setId(5);
+        rm.setEventId(33);
+        rm.setAttempts(0);
+        rm.setMaxAttempts(2);
+        when(retryMessageRepository.findById(5)).thenReturn(Optional.of(rm));
 
-        when(retryMessageRepository.findById(1)).thenReturn(Optional.of(rm));
+        ConsumeResult res = service.failRetry(5);
 
-        ConsumeResult result = kafkaMockService.failRetry(1);
-
-        assertEquals(ConsumeResult.Status.DEAD, result.getStatus());
-        verify(deadLetterRepository, times(1)).save(any(DeadLetterMessage.class));
-        verify(retryMessageRepository, times(1)).deleteById(1);
+        assertEquals(ConsumeResult.Status.RETRY, res.getStatus());
+        assertEquals(1, res.getRetryMessage().getAttempts());
+        verify(retryMessageRepository).save(any(RetryMessage.class));
+        verify(deadLetterRepository, never()).save(any());
     }
 
     @Test
-    void failRetry_ShouldIncrementAttempts_WhenBelowMax() {
+    void failRetry_WhenReachesMaxAttempts_MovesToDead() {
         RetryMessage rm = new RetryMessage();
-        rm.setId(1);
-        rm.setEventId(100);
+        rm.setId(5);
+        rm.setEventId(33);
         rm.setAttempts(1);
-        rm.setMaxAttempts(3);
-
-        when(retryMessageRepository.findById(1)).thenReturn(Optional.of(rm));
-
-        ConsumeResult result = kafkaMockService.failRetry(1);
-
-        assertEquals(ConsumeResult.Status.RETRY, result.getStatus());
-        verify(retryMessageRepository, times(1)).save(any(RetryMessage.class));
-    }
-
-    @Test
-    void processRetriesAndExpire_ShouldMoveExpiredRetryToDeadLetter() {
-        RetryMessage rm = new RetryMessage();
-        rm.setId(1);
-        rm.setEventId(200);
-        rm.setAttempts(1);
-        rm.setMaxAttempts(5);
-        rm.setCreatedAt(LocalDateTime.now().minusHours(2));
-        rm.setTtlSeconds(3600L); 
-
-        when(retryMessageRepository.findAll()).thenReturn(List.of(rm));
-
-        kafkaMockService.processRetriesAndExpire();
-
-        verify(deadLetterRepository, times(1)).save(any(DeadLetterMessage.class));
-        verify(retryMessageRepository, times(1)).deleteById(1);
-    }
-
-    @Test
-    void messageLookup_ShouldReturnLiveLocation() {
-        LiveMessage lm = new LiveMessage();
-        lm.setId(1);
-        lm.setEventId(100);
-        lm.setOriginModule("Ventas");
-
-        when(liveMessageRepository.findById(1)).thenReturn(Optional.of(lm));
-
-        MessageLookupResult res = kafkaMockService.messageLookup(1, null);
-
-        assertEquals("LIVE", res.getLocation());
-        assertEquals(100, res.getEventId());
-    }
-
-    @Test
-    void messageLookup_ShouldReturnRetryLocation() {
-        RetryMessage rm = new RetryMessage();
-        rm.setId(2);
-        rm.setEventId(200);
-        rm.setType("PATCH");
+        rm.setMaxAttempts(2);
+        rm.setType("ventas");
         rm.setPayload("{}");
+        when(retryMessageRepository.findById(5)).thenReturn(Optional.of(rm));
 
-        when(retryMessageRepository.findById(2)).thenReturn(Optional.of(rm));
+        ConsumeResult res = service.failRetry(5);
 
-        MessageLookupResult res = kafkaMockService.messageLookup(2, null);
-
-        assertEquals("RETRY", res.getLocation());
-        assertEquals(200, res.getEventId());
+        assertEquals(ConsumeResult.Status.DEAD, res.getStatus());
+        verify(deadLetterRepository).save(any(DeadLetterMessage.class));
+        verify(retryMessageRepository).deleteById(5);
     }
 
     @Test
-    void messageLookup_ShouldReturnDeadLocation() {
-        DeadLetterMessage dm = new DeadLetterMessage();
-        dm.setEventId(300);
-        dm.setType("POST");
-        dm.setPayload("{}");
+    void processRetriesAndExpire_ExpiresByTtlOrAttempts() {
+        RetryMessage a = new RetryMessage();
+        a.setId(1); a.setEventId(1); a.setAttempts(99); a.setMaxAttempts(3); a.setPayload("{}"); a.setType("t");
+        RetryMessage b = new RetryMessage();
+        b.setId(2); b.setEventId(2); b.setAttempts(0); b.setMaxAttempts(9); b.setPayload("{}"); b.setType("t");
+        b.setCreatedAt(LocalDateTime.now().minusHours(2)); b.setTtlSeconds(60L);
+        when(retryMessageRepository.findAll()).thenReturn(List.of(a,b));
 
-        when(deadLetterRepository.findAll()).thenReturn(List.of(dm));
+        service.processRetriesAndExpire();
 
-        MessageLookupResult res = kafkaMockService.messageLookup(null, 300);
+        verify(deadLetterRepository, times(2)).save(any(DeadLetterMessage.class));
+        verify(retryMessageRepository).deleteById(1);
+        verify(retryMessageRepository).deleteById(2);
+    }
 
-        assertEquals("DEAD", res.getLocation());
-        assertEquals(300, res.getEventId());
+    @Test
+    void handleAcknowledgement_NullAck_IsNoop() {
+        service.handleAcknowledgement(null);
+        verifyNoInteractions(liveMessageRepository, retryMessageRepository, deadLetterRepository, consumptionRepository);
+    }
+
+    @Test
+    void handleAcknowledgement_UnknownStatus_NoActionButConsumptionStoredWhenLiveFound() {
+        LiveMessage live = new LiveMessage();
+        live.setId(3);
+        live.setEventId(33);
+        live.setType("ventas.creada");
+        when(liveMessageRepository.findByEventId(33)).thenReturn(Optional.of(live));
+
+        EventAckEntity ack = new EventAckEntity();
+        ack.setEventId("33"); // numérico para mapear a live.eventId
+        ack.setConsumer("modA");
+        ack.setStatus("OTHER");
+
+        service.handleAcknowledgement(ack);
+
+        verify(consumptionRepository).save(any(MessageConsumption.class));
+        verify(liveMessageRepository, never()).delete(any());
+        verify(retryMessageRepository, never()).save(any());
     }
 }

@@ -1,27 +1,29 @@
 package ar.edu.uade.core.service;
 
 import java.time.LocalDateTime;
-import java.util.ArrayList;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
+import ar.edu.uade.core.model.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.SendResult;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
-import ar.edu.uade.core.mock.MockDataFactory;
-import ar.edu.uade.core.model.ConsumeResult;
-import ar.edu.uade.core.model.DeadLetterMessage;
-import ar.edu.uade.core.model.Event;
-import ar.edu.uade.core.model.LiveMessage;
-import ar.edu.uade.core.model.MessageConsumption;
-import ar.edu.uade.core.model.RetryMessage;
 import ar.edu.uade.core.repository.DeadLetterRepository;
 import ar.edu.uade.core.repository.EventRepository;
 import ar.edu.uade.core.repository.LiveMessageRepository;
@@ -50,7 +52,12 @@ public class KafkaMockService {
     @Autowired
     private MessageConsumptionRepository consumptionRepository;
 
-    private final MockDataFactory mock = new MockDataFactory();
+    @Autowired
+    private KafkaTemplate<String, Object> kafkaTemplate;
+
+    @Autowired
+    private TopicResolver topicResolver;
+
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     private final int defaultMaxAttempts = 3;
@@ -58,34 +65,37 @@ public class KafkaMockService {
     private final long defaultTtlSeconds = 60 * 60;
     private final int distinctConsumptionThreshold = 2;
 
-    // ----------------- event & live creation (mocks) -----------------
-    private Event persistEvent(String type, Object payload) {
+    // Config reintentos de envío a Kafka (fail-fast)
+    @Value("${app.kafka.send.max-attempts:3}")
+    private int sendMaxAttempts;
+    @Value("${app.kafka.send.backoff-ms:500}")
+    private long sendBackoffMs;
+    @Value("${app.kafka.send.timeout-ms:5000}")
+    private long sendTimeoutMs;
+
+    // ----------------- event & live creation (from middleware) -----------------
+    private Event persistEvent(String type, String payload, String originModule, LocalDateTime ts) {
+        Event event = new Event();
+        event.setType(type);
+        event.setPayload(payload);
+        event.setOriginModule(originModule);
+        event.setTimestamp(ts != null ? ts : LocalDateTime.now());
+        return eventRepository.save(event);
+    }
+
+    public Event ingestEvent(EventRequest req){
+        if (req == null) throw new IllegalArgumentException("Request is null");
+        if (req.getType() == null || req.getType().isBlank()) throw new IllegalArgumentException("type is required");
+        if (req.getOriginModule() == null || req.getOriginModule().isBlank()) throw new IllegalArgumentException("originModule is required");
+        String payloadJson;
         try {
-            String payloadJson;
-            try {
-                payloadJson = objectMapper.writeValueAsString(payload);
-            } catch (JsonProcessingException e) {
-                payloadJson = payload.toString();
-            }
-            String origin = inferOriginFromType(type);
-            Event event = new Event(type, payloadJson, origin);
-            return eventRepository.save(event);
-        } catch (Exception e) {
+            payloadJson = objectMapper.writeValueAsString(req.getPayload());
+        } catch (JsonProcessingException e) {
             throw new RuntimeException("Error serializando payload", e);
         }
-    }
+        Event event = persistEvent(req.getType(), payloadJson, req.getOriginModule(), req.getTimestamp());
 
-    private String inferOriginFromType(String type) {
-        if (type == null) return "MOCK";
-        String t = type.toLowerCase();
-        if (t.contains("cart") || t.contains("compra") || t.contains("purchase") || t.contains("cartpurchase")) return "Ventas";
-        if (t.contains("stock") || t.contains("reserve") || t.contains("inventory") || t.contains("stockreserved")) return "Inventario";
-        if (t.contains("view") || t.contains("daily") || t.contains("favourite") || t.contains("fav") || t.contains("analytics") || t.contains("product_views") ) return "Analitica";
-        return "MOCK";
-    }
-
-    private Event sendEvent(String type, Object payload) {
-        Event event = persistEvent(type, payload);
+        // crear live message para seguimiento interno
         LiveMessage lm = new LiveMessage();
         lm.setEventId(event.getId());
         lm.setType(event.getType());
@@ -93,95 +103,50 @@ public class KafkaMockService {
         lm.setTimestamp(event.getTimestamp());
         lm.setOriginModule(event.getOriginModule());
         liveMessageRepository.save(lm);
+
+        // publicar en Kafka con envelope estandarizado
+        String topic = topicResolver.resolveTopic(req.getType(), req.getOriginModule());
+        EventMessage msg = new EventMessage(
+                UUID.randomUUID().toString(),
+                req.getType(), // eventType mantiene el tipo original
+                OffsetDateTime.now(ZoneOffset.UTC),
+                req.getOriginModule(),
+                req.getPayload()
+        );
+        // Envío síncrono con reintentos limitados
+        sendToKafkaWithRetries(topic, msg.getEventId(), msg);
+        log.info("Event {} publicado en topic {} (msgId={})", event.getId(), topic, msg.getEventId());
         return event;
+    }
+
+    private void sendToKafkaWithRetries(String topic, String key, Object value){
+        int attempt = 0;
+        Exception last = null;
+        while (attempt < sendMaxAttempts){
+            attempt++;
+            try {
+                log.debug("[KafkaSend] Enviando a topic='{}' intento {}/{}", topic, attempt, sendMaxAttempts);
+                CompletableFuture<SendResult<String, Object>> future = kafkaTemplate.send(topic, key, value);
+                // esperar resultado con timeout para fail-fast
+                SendResult<String, Object> res = future.get(sendTimeoutMs, TimeUnit.MILLISECONDS);
+                if (res != null) {
+                    return; // OK
+                }
+            } catch (Exception ex){
+                last = ex;
+                log.warn("[KafkaSend] Fallo en envio a '{}' intento {}/{}: {}", topic, attempt, sendMaxAttempts, ex.getMessage());
+                if (attempt < sendMaxAttempts){
+                    try { Thread.sleep(sendBackoffMs); } catch (InterruptedException ie){ Thread.currentThread().interrupt(); }
+                }
+            }
+        }
+        String err = String.format("No se pudo publicar en Kafka tras %d intentos (topic=%s)", sendMaxAttempts, topic);
+        log.error("[KafkaSend] {}", err, last);
+        throw new IllegalStateException(err, last);
     }
 
     public List<Event> getAll(){
         return eventRepository.findAll();
-    }
-
-    // expose some mocks
-    public List<Event> createBrand() {
-        List<Event> results = new ArrayList<>();
-        results.add(sendEvent("POST: Marca creada", MockDataFactory.sony()));
-        results.add(sendEvent("POST: Marca creada", MockDataFactory.apple()));
-        return results;
-    }
-
-    // RESTAURADOS: métodos que llenan la tabla event + live_message
-    public List<Event> createCategory() {
-        List<Event> results = new ArrayList<>();
-        results.add(sendEvent("POST: Categoría creada", MockDataFactory.audio()));
-        results.add(sendEvent("POST: Categoría creada", MockDataFactory.wearables()));
-        return results;
-    }
-
-    public List<Event> deactivateCategory() {
-        List<Event> results = new ArrayList<>();
-        results.add(sendEvent("PATCH: Categoría desactivada", MockDataFactory.audioInactive()));
-        return results;
-    }
-
-    public List<Event> createProduct() {
-        List<Event> results = new ArrayList<>();
-        results.add(sendEvent("POST: Producto creado", MockDataFactory.sonyHeadphones()));
-        return results;
-    }
-
-    public List<Event> updateProductStockDecrease() {
-        List<Event> results = new ArrayList<>();
-        results.add(sendEvent("PATCH: Stock disminuido", MockDataFactory.sonyHeadphonesDecreaseStock()));
-        return results;
-    }
-
-    public List<Event> updateProductStockIncrease() {
-        List<Event> results = new ArrayList<>();
-        results.add(sendEvent("PATCH: Stock aumentado", MockDataFactory.sonyHeadphonesIncreaseStock()));
-        return results;
-    }
-
-    public List<Event> updateProductPrice() {
-        List<Event> results = new ArrayList<>();
-        results.add(sendEvent("PATCH: Precio actualizado", MockDataFactory.sonyHeadphonesPriceChange()));
-        return results;
-    }
-
-    public List<Event> updateProductGeneral() {
-        List<Event> results = new ArrayList<>();
-        results.add(sendEvent("PUT: Producto actualizado", MockDataFactory.sonyHeadphonesUpdated()));
-        return results;
-    }
-
-    public List<Event> deactivateProduct() {
-        List<Event> results = new ArrayList<>();
-        results.add(sendEvent("PATCH: Producto desactivado", MockDataFactory.sonyHeadphonesDeactivate()));
-        return results;
-    }
-
-    public List<Event> createCart() {
-        List<Event> results = new ArrayList<>();
-        results.add(sendEvent("POST: Carrito creado", MockDataFactory.cartWithSony()));
-        return results;
-    }
-
-    public List<Event> updateCartAddProduct() {
-        List<Event> results = new ArrayList<>();
-        results.add(sendEvent("PUT: Producto agregado al carrito", MockDataFactory.cartAddAppleWatch()));
-        return results;
-    }
-
-    public List<Event> updateCartRemoveProduct() {
-        List<Event> results = new ArrayList<>();
-        results.add(sendEvent("PUT: Producto eliminado del carrito", MockDataFactory.cartRemoveSony()));
-        return results;
-    }
-
-    public List<Event> createPurchase() {
-        List<Event> results = new ArrayList<>();
-        results.add(sendEvent("POST: Compra pendiente", MockDataFactory.purchasePending()));
-        results.add(sendEvent("PATCH: Compra confirmada", MockDataFactory.purchaseConfirmed()));
-        results.add(sendEvent("PATCH: Compra enviada", MockDataFactory.purchaseShipped()));
-        return results;
     }
 
     // ----------------- listas -----------------
@@ -211,8 +176,19 @@ public class KafkaMockService {
         // buscar en retries
         RetryMessage rm = null;
         if (liveId != null) rm = retryMessageRepository.findByOriginalLiveId(liveId).orElse(null);
-        if (rm == null && liveId != null) rm = retryMessageRepository.findById(liveId).orElse(null);
+        if (rm == null && liveId != null) rm = retryMessageRepository.findById(liveId).orElse(null); // caso cliente pasó retryId
         if (rm == null && eventId != null) rm = retryMessageRepository.findByEventId(eventId).orElse(null);
+        if (rm == null && eventId == null && liveId != null) rm = retryMessageRepository.findByEventId(liveId).orElse(null);
+        if (rm == null){
+            // fallback: buscar consumptions previas por liveMessageId y usar eventId encontrado
+            if (liveId != null){
+                var consumptions = consumptionRepository.findByLiveMessageId(liveId);
+                if (consumptions != null && !consumptions.isEmpty()){
+                    Integer evt = consumptions.get(0).getEventId();
+                    rm = retryMessageRepository.findByEventId(evt).orElse(null);
+                }
+            }
+        }
         if (rm != null){
             res.setLocation("RETRY");
             res.setRetryId(rm.getId());
@@ -244,15 +220,6 @@ public class KafkaMockService {
         if (liveId != null) return consumptionRepository.findByLiveMessageId(liveId);
         if (eventId != null) return consumptionRepository.findByEventId(eventId);
         return consumptionRepository.findAll();
-    }
-
-    // Obtener live/retry por id
-    public LiveMessage getLiveById(Integer id){
-        return liveMessageRepository.findById(id).orElse(null);
-    }
-
-    public RetryMessage getRetryById(Integer id){
-        return retryMessageRepository.findById(id).orElse(null);
     }
 
     // ----------------- consumo (core) -----------------
@@ -419,5 +386,149 @@ public class KafkaMockService {
             }
         }
     }
+    @Transactional
+    public void handleAcknowledgement(EventAckEntity ack) {
+        if (ack == null) {
+            log.warn("[Core] ACK recibido es nulo. Se ignora.");
+            return;
+        }
 
+        String eventId = ack.getEventId();
+        String consumer = ack.getConsumer();
+        String status = ack.getStatus();
+
+        log.info("[Core] ACK recibido --> eventId={} | consumer={} | status={} | attempts={}",
+                eventId, consumer, status, ack.getAttempts());
+
+        if (eventId == null || eventId.isBlank()) {
+            log.warn("[Core] ACK inválido: eventId es null o vacío. Se ignora.");
+            return;
+        }
+
+        // Buscar LiveMessage asociado al eventId
+        Optional<LiveMessage> liveOpt = liveMessageRepository.findByEventId(Integer.valueOf(ack.getEventId()));
+        if (liveOpt.isEmpty()) {
+            log.warn("[Core] No se encontró LiveMessage para eventId={}", eventId);
+            return;
+        }
+
+        LiveMessage live = liveOpt.get();
+        String eventType = live.getType();
+
+        // Registrar consumo
+        MessageConsumption mc = new MessageConsumption();
+        mc.setEventId(live.getEventId());
+        mc.setLiveMessageId(live.getId());
+        mc.setModuleName(consumer != null ? consumer : "Desconocido");
+        mc.setConsumedAt(LocalDateTime.now());
+        consumptionRepository.save(mc);
+
+        // Procesar el ACK según estado
+        if ("FAIL".equalsIgnoreCase(status) || "FAILED".equalsIgnoreCase(status)) {
+            log.info("[Core] ACK indica fallo. Moviendo LiveMessage {} (eventId={}) a cola de reintentos.",
+                    live.getId(), eventId);
+            moveMessageToRetry(live.getId(), consumer);
+            return;
+        }
+
+        if ("CONSUMED".equalsIgnoreCase(status) || "SUCCESS".equalsIgnoreCase(status)) {
+            // Verificar si todos los consumidores ya consumieron este evento
+            if (allModulesConsumedSuccessfully(live.getEventId(), eventType)) {
+                DeadLetterMessage dm = new DeadLetterMessage();
+                dm.setEventId(live.getEventId());
+                dm.setType(live.getType());
+                dm.setPayload(live.getPayload());
+                dm.setReason("SUCCESS");
+                dm.setMovedAt(LocalDateTime.now());
+
+                deadLetterRepository.save(dm);
+                liveMessageRepository.delete(live);
+
+                log.info("[Core] Evento {} (tipo: {}) consumido exitosamente por todos los módulos. Movido a DeadLetter y eliminado de Live.",
+                        live.getEventId(), eventType);
+            } else {
+                log.debug("[Core] Evento {} aún tiene módulos pendientes de consumo.", eventId);
+            }
+        } else {
+            log.warn("[Core] Estado de ACK desconocido: '{}'. No se realiza ninguna acción.", status);
+        }
+    }
+
+
+    private boolean allModulesConsumedSuccessfully(Integer eventId, String eventType) {
+        List<String> expectedModules = getExpectedConsumers(eventType);
+        if (expectedModules.isEmpty()) {
+            log.info("[Core] Evento {} no tiene módulos destino configurados, se considera consumido.", eventId);
+            return true;
+        }
+
+        List<MessageConsumption> consumptions = consumptionRepository.findByEventId(eventId);
+        Set<String> consumedModules = consumptions.stream()
+                .map(mc -> mc.getModuleName().toLowerCase())
+                .collect(Collectors.toSet());
+
+        boolean allOk = consumedModules.containsAll(expectedModules);
+
+        if (allOk) {
+            log.info("[Core] Evento {} consumido por todos los módulos esperados: {}", eventId, expectedModules);
+        } else {
+            log.info("[Core] Evento {} aún pendiente de consumo por: {}",
+                    eventId,
+                    expectedModules.stream().filter(m -> !consumedModules.contains(m)).toList());
+        }
+
+        return allOk;
+    }
+
+    private List<String> getExpectedConsumers(String eventType) {
+        String type = eventType.toLowerCase();
+
+        if (type.contains("stock") || type.contains("producto") || type.contains("marca") || type.contains("categoría")) {
+            return List.of("ventas", "analitica");
+        }
+        if (type.contains("pendiente")) {
+            return List.of("inventario");
+        }
+        if (type.contains("confirmada")) {
+            return List.of("inventario", "analitica");
+        }
+        if (type.contains("cancelada") || type.contains("rollback")) {
+            return List.of("inventario");
+        }
+        if (type.contains("review") || type.contains("favorito") || type.contains("vista")) {
+            return List.of("analitica");
+        }
+        if (type.contains("batch")) {
+            return List.of("ventas", "analitica");
+        }
+        return List.of(); // por defecto, ninguno
+    }
+
+    private void moveMessageToRetry(Integer liveMessageId, String failedModule) {
+        Optional<LiveMessage> liveOpt = liveMessageRepository.findById(liveMessageId);
+        if (liveOpt.isEmpty()) {
+            log.warn("[Core] No se encontró LiveMessage con ID {} para mover a Retry", liveMessageId);
+            return;
+        }
+
+        LiveMessage live = liveOpt.get();
+
+        RetryMessage retry = new RetryMessage();
+        retry.setEventId(live.getEventId());
+        retry.setOriginalLiveId(live.getId());
+        retry.setType(live.getType());
+        retry.setPayload(live.getPayload());
+        retry.setAttempts(0); //es 0 xq si estaba en la cola de vivos quiere decir que nunca se reintento
+        retry.setMaxAttempts(defaultMaxAttempts);
+        retry.setTtlSeconds(600L); // 10 min. modificarlo para pruebas o expos
+        retry.setCreatedAt(LocalDateTime.now());
+        retry.setNextAttemptAt(LocalDateTime.now().plusMinutes(2)); // reintentar en 2 min
+        retry.setConsumerModule(failedModule);
+
+        retryMessageRepository.save(retry);
+        liveMessageRepository.delete(live);
+
+        log.info("[Core] Evento {} (tipo: {}) movido a Retry. Módulo fallido: {}",
+                live.getEventId(), live.getType(), failedModule);
+    }
 }
